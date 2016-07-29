@@ -76,11 +76,15 @@ conf.registerGlobalValue(
 
 conf.registerGroup(Fedora, 'karma')
 conf.registerGlobalValue(
-    Fedora.karma, 'db_path',
-    registry.String('/var/tmp/supybot-karma.db',
-                    """Path to a karma db on disk"""))
+    Fedora.karma, 'pps_url',
+    registry.String('http://localhost:5000',
+                    """URL to a Plus Plus Service instance"""))
 conf.registerGlobalValue(
-    Fedora.karma, 'url',
+    Fedora.karma, 'pps_token',
+    registry.String('changeme',
+                    """Token to authenticate to the Plus Plus Service instance"""))
+conf.registerGlobalValue(
+    Fedora.karma, 'info_url',
     registry.String('https://badges.fedoraproject.org/badge/macaron-cookie-i',
                     """URL to link people to about karma."""))
 # Here, 'unaddressed' commands are ones that are not directly addressed to the

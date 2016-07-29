@@ -58,6 +58,7 @@ import fedmsg.meta
 
 import simplejson
 import urllib
+import urlparse
 import socket
 import pytz
 import datetime
@@ -229,10 +230,6 @@ class Fedora(callbacks.Plugin):
         self._refresh()
         irc.replySuccess()
     refresh = wrap(refresh)
-
-    @property
-    def karma_db_path(self):
-        return self.registryValue('karma.db_path')
 
     @property
     def allow_unaddressed_karma(self):
@@ -792,53 +789,17 @@ class Fedora(callbacks.Plugin):
         collections.sort(key=lambda c: int(c['version']))
         return collections[-1]['branchname'].encode('utf-8')
 
-    def open_karma_db(self):
-        data = shelve.open(self.karma_db_path)
-        if 'backwards' in data:
-            # This is the old style data.  convert it to the new form.
-            release = self.get_current_release()
-            data['forwards-' + release] = copy.copy(data['forwards'])
-            data['backwards-' + release] = copy.copy(data['backwards'])
-            del data['forwards']
-            del data['backwards']
-            data.sync()
-        return data
-
     def karma(self, irc, msg, args, name):
         """<username>
 
         Return the total karma for a FAS user."""
-        data = None
-        try:
-            data = self.open_karma_db()
-            if name in self.nickmap:
-                name = self.nickmap[name]
-            release = self.get_current_release()
-            votes = data['backwards-' + release].get(name, {})
-            alltime = []
-            for key in data:
-                if 'backwards-' not in key:
-                    continue
-                alltime.append(data[key].get(name, {}))
-        finally:
-            if data:
-                data.close()
-
-        inc = len([v for v in votes.values() if v == 1])
-        dec = len([v for v in votes.values() if v == -1])
-        total = inc - dec
-
-        alltime_inc = alltime_dec = 0
-        for release in alltime:
-            alltime_inc += len([v for v in release.values() if v == 1])
-            alltime_dec += len([v for v in release.values() if v == -1])
-        alltime_total = alltime_inc - alltime_dec
-
-        irc.reply("Karma for %s has been increased %i times and "
-                    "decreased %i times this release cycle for a "
-                    "total of %i (%i all time)" % (
-                    name, inc, dec, total, alltime_total))
-
+        karma_url = urljoin(self.registryValue('karma.pps_url'), name)
+        result = requests.get(self.karma_url)
+        data = result.json()
+        irc.reply("Karma for %(username)s has been increased %(increments)i "
+                  "times and decreased %(decrements)i times this release "
+                  "cycle for a total of %(current)i (%(total)i all time)"
+                  % data)
 
     karma = wrap(karma, ['text'])
 
@@ -856,21 +817,6 @@ class Fedora(callbacks.Plugin):
 
         increment = direction == '++' # If not, then it must be decrement
 
-        # Check that these are FAS users
-        if not agent in self.nickmap and not agent in self.users:
-            self.log.info(
-                "Saw %s from %s, but %s not in FAS" % (recip, agent, agent))
-            if explicit:
-                irc.reply("Couldn't find %s in FAS" % agent)
-            return
-
-        if not recip in self.nickmap and not recip in self.users:
-            self.log.info(
-                "Saw %s from %s, but %s not in FAS" % (recip, agent, recip))
-            if explicit:
-                irc.reply("Couldn't find %s in FAS" % recip)
-            return
-
         # Transform irc nicks into fas usernames if possible.
         if agent in self.nickmap:
             agent = self.nickmap[agent]
@@ -878,83 +824,42 @@ class Fedora(callbacks.Plugin):
         if recip in self.nickmap:
             recip = self.nickmap[recip]
 
-        if agent == recip:
-            irc.reply("You may not modify your own karma.")
-            return
-
-        release = self.get_current_release()
-
-        # Check our karma db to make sure this hasn't already been done.
-        data = None
-        try:
-            data = shelve.open(self.karma_db_path)
-            fkey = 'forwards-' + release
-            bkey = 'backwards-' + release
-            if fkey not in data:
-                data[fkey] = {}
-
-            if bkey not in data:
-                data[bkey] = {}
-
-            if agent not in data[fkey]:
-                forwards = data[fkey]
-                forwards[agent] = {}
-                data[fkey] = forwards
-
-            if recip not in data[bkey]:
-                backwards = data[bkey]
-                backwards[recip] = {}
-                data[bkey] = backwards
-
-            vote = 1 if increment else -1
-
-            if data[fkey][agent].get(recip) == vote:
-                ## People found this response annoying.
-                ## https://github.com/fedora-infra/supybot-fedora/issues/25
-                #irc.reply(
-                #    "You have already given %i karma to %s" % (vote, recip))
-                return
-
-            forwards = data[fkey]
-            forwards[agent][recip] = vote
-            data[fkey] = forwards
-
-            backwards = data[bkey]
-            backwards[recip][agent] = vote
-            data[bkey] = backwards
-
-            # Count the number of karmas for old so-and-so.
-            total_this_release = sum(data[bkey][recip].values())
-
-            total_all_time = 0
-            for key in data:
-                if 'backwards-' not in key:
-                    continue
-                total_all_time += sum(data[key].get(recip, {}).values())
-        finally:
-            if data:
-                data.close()
-
-        fedmsg.publish(
-            name="supybot.%s" % socket.gethostname(),
-            modname="irc", topic="karma",
-            msg={
-                'agent': agent,
-                'recipient': recip,
-                'total': total_all_time,  # The badge rules use this value
-                'total_this_release': total_this_release,
-                'vote': vote,
+        # Call Plus Plus Service
+        karma_url = urljoin(self.registryValue('karma.pps_url'), recip)
+        post_data = {
+            'sender': agent,
+            'extra': json.dumps({
                 'channel': channel,
                 'line': line,
-                'release': release,
-            },
-        )
+            }),
+        }
+        if not increment:
+            post_data['decrement'] = '1'
+        headers = {
+            'Authorization': 'token %s' % self.registryValue('karma.pps_token')
+        }
+        result = requests.post(karma_url, data=post_data, headers=headers)
 
-        url = self.registryValue('karma.url')
+        if result.status_code != 200:
+            self.log.info(
+                "Error from Plus Plus Service: %s", result.text)
+            if explicit:
+                irc.reply(result.text)
+            return
+
+        data = result.json()
+
+        if data.get("existing"):
+            ## People found this response annoying.
+            ## https://github.com/fedora-infra/supybot-fedora/issues/25
+            #irc.reply("You have already given karma to %s" % recip)
+            return
+
+        data['info_url'] = self.registryValue('karma.info_url')
         irc.reply(
-            'Karma for %s changed to %r '
-            '(for the current release cycle):  %s' % (
-                recip, total_this_release, url))
+            'Karma for %(username)s changed to %(current)i '
+            '(for the current release cycle):  %(info_url)s' %
+            data)
 
 
     def wikilink(self, irc, msg, args, name):
